@@ -220,6 +220,52 @@ void lv2_manager_destroy(Lv2Manager *manager) {
   free(manager);
 }
 
+Lv2PluginAvailableList lv2_manager_get_available_plugins(Lv2Manager *manager) {
+  Lv2PluginAvailableList list = {NULL, 0};
+  if (!manager || !manager->world) return list;
+
+  const LilvPlugins *plugins = lilv_world_get_all_plugins(manager->world);
+  uint32_t total = lilv_plugins_size(plugins);
+  if (total == 0) return list;
+
+  list.plugins = calloc(total, sizeof(Lv2PluginAvailableInfo));
+  size_t idx = 0;
+
+  LILV_FOREACH(plugins, i, plugins) {
+    const LilvPlugin *p = lilv_plugins_get(plugins, i);
+    const LilvNode *uri_node = lilv_plugin_get_uri(p);
+    LilvNode *name_node = lilv_plugin_get_name(p);
+    const LilvPluginClass *pclass = lilv_plugin_get_class(p);
+    const LilvNode *class_node = pclass ? lilv_plugin_class_get_label(pclass) : NULL;
+
+    const char *uri_str = uri_node ? lilv_node_as_uri(uri_node) : NULL;
+    const char *name_str = name_node ? lilv_node_as_string(name_node) : NULL;
+    const char *cat_str = class_node ? lilv_node_as_string(class_node) : "Plugin";
+
+    if (name_str && uri_str) {
+      list.plugins[idx].name = strdup(name_str);
+      list.plugins[idx].uri = strdup(uri_str);
+      list.plugins[idx].category = strdup(cat_str);
+      idx++;
+    }
+    lilv_node_free(name_node);
+  }
+  list.count = idx;
+  return list;
+}
+
+void lv2_manager_free_available_plugins(Lv2PluginAvailableList *list) {
+  if (!list || !list->plugins) return;
+  for (size_t i = 0; i < list->count; i++) {
+    free(list->plugins[i].name);
+    free(list->plugins[i].uri);
+    free(list->plugins[i].category);
+  }
+  free(list->plugins);
+  list->plugins = NULL;
+  list->count = 0;
+}
+
 int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
   if (manager == NULL || target_uri == NULL || manager->world == NULL) return -1;
 

@@ -46,6 +46,23 @@ typedef struct {
 } Lv2FilterInfo;
 
 /**
+ * @brief Metadata for an available installed LV2 plugin on the system.
+ */
+typedef struct {
+  char *name;
+  char *uri;
+  char *category;
+} Lv2PluginAvailableInfo;
+
+/**
+ * @brief List container for available installed LV2 plugins.
+ */
+typedef struct {
+  Lv2PluginAvailableInfo *plugins;
+  size_t count;
+} Lv2PluginAvailableList;
+
+/**
  * @brief Creates a new Lv2Manager instance.
  * @param n_samples Initial internal double-buffer sample capacity (expands dynamically)
  * @param min_filter_count Initial filter array capacity
@@ -59,6 +76,19 @@ Lv2Manager *lv2_manager_create(int n_samples, int min_filter_count, int sample_r
  * @param manager Pointer to Lv2Manager instance
  */
 void lv2_manager_destroy(Lv2Manager *manager);
+
+/**
+ * @brief Queries all installed LV2 plugins on the system for plugin discovery / selection menus.
+ * @param manager Pointer to Lv2Manager instance
+ * @return Lv2PluginAvailableList Container struct of available plugins (must free with lv2_manager_free_available_plugins)
+ */
+Lv2PluginAvailableList lv2_manager_get_available_plugins(Lv2Manager *manager);
+
+/**
+ * @brief Frees memory allocated by lv2_manager_get_available_plugins.
+ * @param list Pointer to Lv2PluginAvailableList container
+ */
+void lv2_manager_free_available_plugins(Lv2PluginAvailableList *list);
 
 /**
  * @brief Adds a new filter to the end of the processing chain.
