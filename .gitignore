@@ -1,0 +1,7 @@
+# Compilation Database & Local IDE configs
+compile_commands.json
+
+# Build artifacts & binaries
+test_chain
+*.o
+*.so
