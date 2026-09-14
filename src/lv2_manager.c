@@ -696,7 +696,8 @@ bool lv2_manager_set_param(Lv2Manager *manager, size_t filter_index, const char 
 
   struct Filter *f = &manager->filters[filter_index];
   for (size_t i = 0; i < f->param_count; i++) {
-    if (strcmp(f->params[i].symbol, symbol) == 0) {
+    if ((f->params[i].symbol && strcmp(f->params[i].symbol, symbol) == 0) ||
+        (f->params[i].name && strcmp(f->params[i].name, symbol) == 0)) {
       uint32_t p = f->params[i].port_index;
       f->control_values[p] = value;
       f->params[i].current_val = value;
@@ -719,7 +720,8 @@ float lv2_manager_get_param(Lv2Manager *manager, size_t filter_index, const char
 
   struct Filter *f = &manager->filters[filter_index];
   for (size_t i = 0; i < f->param_count; i++) {
-    if (strcmp(f->params[i].symbol, symbol) == 0) {
+    if ((f->params[i].symbol && strcmp(f->params[i].symbol, symbol) == 0) ||
+        (f->params[i].name && strcmp(f->params[i].name, symbol) == 0)) {
       uint32_t p = f->params[i].port_index;
       float val = f->control_values[p];
       pthread_mutex_unlock(&manager->process_mutex);
