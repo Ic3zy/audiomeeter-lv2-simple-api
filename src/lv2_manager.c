@@ -4,11 +4,21 @@
 
 #include <lilv/lilv.h>
 #include <lv2/urid/urid.h>
+#include <lv2/options/options.h>
+#include <lv2/buf-size/buf-size.h>
+#include <lv2/parameters/parameters.h>
+#include <lv2/atom/atom.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+
+// Shared global LilvWorld instance and reference counter across all chain managers
+static LilvWorld *g_world = NULL;
+static size_t g_world_ref_count = 0;
+static pthread_mutex_t g_world_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
   char **uris;
@@ -66,7 +76,16 @@ struct Lv2Manager {
   LV2_URID_Unmap unmap_feature;
   LV2_Feature uri_map_feature;
   LV2_Feature uri_unmap_feature;
-  const LV2_Feature *features[3];
+
+  // Additional Host Features (Options & Bounded Block Length)
+  LV2_Feature options_feature;
+  LV2_Feature bounded_block_feature;
+  LV2_Options_Option options[5];
+  int32_t max_block_size_option;
+  int32_t min_block_size_option;
+  float sample_rate_option;
+
+  const LV2_Feature *features[5];
 };
 
 static LV2_URID host_urid_map(LV2_URID_Map_Handle handle, const char *uri) {
@@ -138,15 +157,25 @@ Lv2Manager *lv2_manager_create(int n_samples, int min_filter_count, int sample_r
   }
   manager->filter_capacity = capacity;
 
-  manager->world = lilv_world_new();
-  if (manager->world) {
-    lilv_world_load_all(manager->world);
+  // Refcounted Shared LilvWorld: Scans disk & RDF manifests ONCE globally (Thread-Safe)
+  pthread_mutex_lock(&g_world_mutex);
+  if (g_world == NULL) {
+    g_world = lilv_world_new();
+    if (g_world) {
+      lilv_world_load_all(g_world);
+    }
+  }
+
+  if (g_world != NULL) {
+    g_world_ref_count++;
+    manager->world = g_world;
     manager->lv2_InputPort   = lilv_new_uri(manager->world, LV2_CORE__InputPort);
     manager->lv2_OutputPort  = lilv_new_uri(manager->world, LV2_CORE__OutputPort);
     manager->lv2_AudioPort   = lilv_new_uri(manager->world, LV2_CORE__AudioPort);
     manager->lv2_ControlPort = lilv_new_uri(manager->world, LV2_CORE__ControlPort);
     manager->lv2_toggled     = lilv_new_uri(manager->world, LV2_CORE__toggled);
   }
+  pthread_mutex_unlock(&g_world_mutex);
 
   manager->sample_rate = sample_rate;
 
@@ -163,9 +192,33 @@ Lv2Manager *lv2_manager_create(int n_samples, int min_filter_count, int sample_r
   manager->uri_unmap_feature.URI = LV2_URID__unmap;
   manager->uri_unmap_feature.data = &manager->unmap_feature;
 
+  // Options & Bounded Block Length Features setup
+  manager->max_block_size_option = initial_size;
+  manager->min_block_size_option = 1;
+  manager->sample_rate_option    = (float)sample_rate;
+
+  LV2_URID bufsz_max = host_urid_map(&manager->urid_map, LV2_BUF_SIZE__maxBlockLength);
+  LV2_URID bufsz_min = host_urid_map(&manager->urid_map, LV2_BUF_SIZE__minBlockLength);
+  LV2_URID param_sr  = host_urid_map(&manager->urid_map, LV2_PARAMETERS__sampleRate);
+  LV2_URID atom_int  = host_urid_map(&manager->urid_map, LV2_ATOM__Int);
+  LV2_URID atom_float= host_urid_map(&manager->urid_map, LV2_ATOM__Float);
+
+  manager->options[0] = (LV2_Options_Option){ LV2_OPTIONS_INSTANCE, 0, bufsz_max, sizeof(int32_t), atom_int, &manager->max_block_size_option };
+  manager->options[1] = (LV2_Options_Option){ LV2_OPTIONS_INSTANCE, 0, bufsz_min, sizeof(int32_t), atom_int, &manager->min_block_size_option };
+  manager->options[2] = (LV2_Options_Option){ LV2_OPTIONS_INSTANCE, 0, param_sr, sizeof(float), atom_float, &manager->sample_rate_option };
+  manager->options[3] = (LV2_Options_Option){ LV2_OPTIONS_INSTANCE, 0, 0, 0, 0, NULL };
+
+  manager->options_feature.URI = LV2_OPTIONS__options;
+  manager->options_feature.data = manager->options;
+
+  manager->bounded_block_feature.URI = LV2_BUF_SIZE__boundedBlockLength;
+  manager->bounded_block_feature.data = NULL;
+
   manager->features[0] = &manager->uri_map_feature;
   manager->features[1] = &manager->uri_unmap_feature;
-  manager->features[2] = NULL;
+  manager->features[2] = &manager->options_feature;
+  manager->features[3] = &manager->bounded_block_feature;
+  manager->features[4] = NULL;
 
   return manager;
 }
@@ -210,12 +263,20 @@ void lv2_manager_destroy(Lv2Manager *manager) {
   free(manager->out2.pub.right);
 
   if (manager->world) {
+    pthread_mutex_lock(&g_world_mutex);
     lilv_node_free(manager->lv2_InputPort);
     lilv_node_free(manager->lv2_OutputPort);
     lilv_node_free(manager->lv2_AudioPort);
     lilv_node_free(manager->lv2_ControlPort);
     lilv_node_free(manager->lv2_toggled);
-    lilv_world_free(manager->world);
+
+    // Refcounted release of shared LilvWorld
+    g_world_ref_count--;
+    if (g_world_ref_count == 0 && g_world != NULL) {
+      lilv_world_free(g_world);
+      g_world = NULL;
+    }
+    pthread_mutex_unlock(&g_world_mutex);
   }
   free(manager);
 }
@@ -304,7 +365,7 @@ int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
 
   LilvInstance *instance = lilv_plugin_instantiate(target_plugin, manager->sample_rate, manager->features);
   if (!instance) {
-    fprintf(stderr, "Error: Plugin instantiate failed\n");
+    fprintf(stderr, "Error: Plugin instantiate failed for URI pattern: %s\n", target_uri);
     return -1;
   }
 
