@@ -46,6 +46,9 @@ struct Filter {
   // Parameters metadata
   Lv2ParamInfo *params;
   size_t param_count;
+
+  // Atom / Event port dummy buffers
+  uint8_t **atom_buffers;
 };
 
 struct OutputInternal {
@@ -62,6 +65,8 @@ struct Lv2Manager {
 
   int sample_rate;
   LilvWorld *world;
+
+  pthread_mutex_t process_mutex;
 
   // Cached Lilv URIs for port classification
   LilvNode *lv2_InputPort;
@@ -133,6 +138,8 @@ Lv2Manager *lv2_manager_create(int n_samples, int min_filter_count, int sample_r
   Lv2Manager *manager = calloc(1, sizeof(*manager));
   if (manager == NULL) return NULL;
 
+  pthread_mutex_init(&manager->process_mutex, NULL);
+
   int initial_size = n_samples > 0 ? n_samples : 512;
 
   manager->out1.pub.left = calloc(initial_size, sizeof(float));
@@ -152,6 +159,7 @@ Lv2Manager *lv2_manager_create(int n_samples, int min_filter_count, int sample_r
     free(manager->out2.pub.left);
     free(manager->out2.pub.right);
     free(manager->filters);
+    pthread_mutex_destroy(&manager->process_mutex);
     free(manager);
     return NULL;
   }
@@ -241,12 +249,20 @@ static void free_filter_struct(struct Filter *f) {
     }
     free(f->params);
   }
+
+  if (f->atom_buffers) {
+    for (uint32_t i = 0; i < f->num_ports; i++) {
+      free(f->atom_buffers[i]);
+    }
+    free(f->atom_buffers);
+  }
   memset(f, 0, sizeof(*f));
 }
 
 void lv2_manager_destroy(Lv2Manager *manager) {
   if (manager == NULL) return;
 
+  pthread_mutex_lock(&manager->process_mutex);
   for (size_t i = 0; i < manager->filter_count; i++) {
     free_filter_struct(&manager->filters[i]);
   }
@@ -261,6 +277,8 @@ void lv2_manager_destroy(Lv2Manager *manager) {
   free(manager->out1.pub.right);
   free(manager->out2.pub.left);
   free(manager->out2.pub.right);
+  pthread_mutex_unlock(&manager->process_mutex);
+  pthread_mutex_destroy(&manager->process_mutex);
 
   if (manager->world) {
     pthread_mutex_lock(&g_world_mutex);
@@ -285,15 +303,31 @@ Lv2PluginAvailableList lv2_manager_get_available_plugins(Lv2Manager *manager) {
   Lv2PluginAvailableList list = {NULL, 0};
   if (!manager || !manager->world) return list;
 
+  pthread_mutex_lock(&g_world_mutex);
   const LilvPlugins *plugins = lilv_world_get_all_plugins(manager->world);
   uint32_t total = lilv_plugins_size(plugins);
-  if (total == 0) return list;
+  if (total == 0) {
+    pthread_mutex_unlock(&g_world_mutex);
+    return list;
+  }
 
-  list.plugins = calloc(total, sizeof(Lv2PluginAvailableInfo));
+  // Collect pointers first to prevent Sord iterator mutation races during property querying
+  const LilvPlugin **plugin_ptrs = calloc(total, sizeof(const LilvPlugin *));
+  if (!plugin_ptrs) {
+    pthread_mutex_unlock(&g_world_mutex);
+    return list;
+  }
+
+  size_t count = 0;
+  LILV_FOREACH(plugins, i, plugins) {
+    plugin_ptrs[count++] = lilv_plugins_get(plugins, i);
+  }
+
+  list.plugins = calloc(count, sizeof(Lv2PluginAvailableInfo));
   size_t idx = 0;
 
-  LILV_FOREACH(plugins, i, plugins) {
-    const LilvPlugin *p = lilv_plugins_get(plugins, i);
+  for (size_t i = 0; i < count; i++) {
+    const LilvPlugin *p = plugin_ptrs[i];
     const LilvNode *uri_node = lilv_plugin_get_uri(p);
     LilvNode *name_node = lilv_plugin_get_name(p);
     const LilvPluginClass *pclass = lilv_plugin_get_class(p);
@@ -311,7 +345,10 @@ Lv2PluginAvailableList lv2_manager_get_available_plugins(Lv2Manager *manager) {
     }
     lilv_node_free(name_node);
   }
+  free(plugin_ptrs);
+
   list.count = idx;
+  pthread_mutex_unlock(&g_world_mutex);
   return list;
 }
 
@@ -330,25 +367,35 @@ void lv2_manager_free_available_plugins(Lv2PluginAvailableList *list) {
 int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
   if (manager == NULL || target_uri == NULL || manager->world == NULL) return -1;
 
-  if (manager->filter_count >= manager->filter_capacity) {
-    size_t new_cap = manager->filter_capacity * 2;
-    struct Filter *new_filters = realloc(manager->filters, sizeof(struct Filter) * new_cap);
-    if (!new_filters) return -1;
-    memset(new_filters + manager->filter_capacity, 0, sizeof(struct Filter) * (new_cap - manager->filter_capacity));
-    manager->filters = new_filters;
-    manager->filter_capacity = new_cap;
-  }
+  pthread_mutex_lock(&g_world_mutex);
 
   const LilvPlugins *plugins = lilv_world_get_all_plugins(manager->world);
+  uint32_t total = lilv_plugins_size(plugins);
+  if (total == 0) {
+    pthread_mutex_unlock(&g_world_mutex);
+    return -1;
+  }
+
+  const LilvPlugin **plugin_ptrs = calloc(total, sizeof(const LilvPlugin *));
+  if (!plugin_ptrs) {
+    pthread_mutex_unlock(&g_world_mutex);
+    return -1;
+  }
+
+  size_t count = 0;
+  LILV_FOREACH(plugins, i, plugins) {
+    plugin_ptrs[count++] = lilv_plugins_get(plugins, i);
+  }
+
   const LilvPlugin *target_plugin = NULL;
 
-  LILV_FOREACH(plugins, i, plugins) {
-    const LilvPlugin *p = lilv_plugins_get(plugins, i);
+  for (size_t i = 0; i < count; i++) {
+    const LilvPlugin *p = plugin_ptrs[i];
     const LilvNode *uri_node = lilv_plugin_get_uri(p);
-    const char *uri = lilv_node_as_uri(uri_node);
+    const char *uri = uri_node ? lilv_node_as_uri(uri_node) : NULL;
 
     LilvNode *name_node = lilv_plugin_get_name(p);
-    const char *name = lilv_node_as_string(name_node);
+    const char *name = name_node ? lilv_node_as_string(name_node) : NULL;
 
     if ((uri && strstr(uri, target_uri)) || (name && strstr(name, target_uri))) {
       target_plugin = p;
@@ -357,15 +404,34 @@ int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
     }
     lilv_node_free(name_node);
   }
+  free(plugin_ptrs);
 
   if (!target_plugin) {
     fprintf(stderr, "Error: Plugin not found for URI pattern: %s\n", target_uri);
+    pthread_mutex_unlock(&g_world_mutex);
     return -1;
+  }
+
+  pthread_mutex_lock(&manager->process_mutex);
+
+  if (manager->filter_count >= manager->filter_capacity) {
+    size_t new_cap = manager->filter_capacity * 2;
+    struct Filter *new_filters = realloc(manager->filters, sizeof(struct Filter) * new_cap);
+    if (!new_filters) {
+      pthread_mutex_unlock(&manager->process_mutex);
+      pthread_mutex_unlock(&g_world_mutex);
+      return -1;
+    }
+    memset(new_filters + manager->filter_capacity, 0, sizeof(struct Filter) * (new_cap - manager->filter_capacity));
+    manager->filters = new_filters;
+    manager->filter_capacity = new_cap;
   }
 
   LilvInstance *instance = lilv_plugin_instantiate(target_plugin, manager->sample_rate, manager->features);
   if (!instance) {
     fprintf(stderr, "Error: Plugin instantiate failed for URI pattern: %s\n", target_uri);
+    pthread_mutex_unlock(&manager->process_mutex);
+    pthread_mutex_unlock(&g_world_mutex);
     return -1;
   }
 
@@ -391,6 +457,9 @@ int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
   filter->num_ports = num_ports;
   filter->control_values = calloc(num_ports, sizeof(float));
   filter->is_control_in = calloc(num_ports, sizeof(bool));
+  filter->atom_buffers = calloc(num_ports, sizeof(uint8_t *));
+
+  LV2_URID atom_seq_urid = host_urid_map(&manager->urid_map, LV2_ATOM__Sequence);
 
   uint32_t audio_in_count = 0;
   uint32_t audio_out_count = 0;
@@ -428,6 +497,19 @@ int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
       lilv_node_free(max_node);
 
       lilv_instance_connect_port(instance, p, &filter->control_values[p]);
+    } else {
+      // Atom, Event or custom non-audio non-control port -> connect valid sequence buffer
+      filter->atom_buffers[p] = calloc(1, 1024);
+      if (filter->atom_buffers[p]) {
+        if (is_input) {
+          LV2_Atom_Sequence *seq = (LV2_Atom_Sequence *)filter->atom_buffers[p];
+          seq->atom.size = sizeof(LV2_Atom_Sequence_Body);
+          seq->atom.type = atom_seq_urid;
+          seq->body.unit = 0;
+          seq->body.pad = 0;
+        }
+        lilv_instance_connect_port(instance, p, filter->atom_buffers[p]);
+      }
     }
   }
 
@@ -466,11 +548,19 @@ int lv2_manager_add_filter(Lv2Manager *manager, const char *target_uri) {
 
   int added_idx = (int)manager->filter_count;
   manager->filter_count++;
+  pthread_mutex_unlock(&manager->process_mutex);
+  pthread_mutex_unlock(&g_world_mutex);
   return added_idx;
 }
 
 bool lv2_manager_remove_filter(Lv2Manager *manager, size_t index) {
-  if (!manager || index >= manager->filter_count) return false;
+  if (!manager) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return false;
+  }
 
   free_filter_struct(&manager->filters[index]);
 
@@ -479,14 +569,22 @@ bool lv2_manager_remove_filter(Lv2Manager *manager, size_t index) {
   }
   memset(&manager->filters[manager->filter_count - 1], 0, sizeof(struct Filter));
   manager->filter_count--;
+  pthread_mutex_unlock(&manager->process_mutex);
   return true;
 }
 
 bool lv2_manager_move_filter(Lv2Manager *manager, size_t old_index, size_t new_index) {
-  if (!manager || old_index >= manager->filter_count || new_index >= manager->filter_count) {
+  if (!manager) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (old_index >= manager->filter_count || new_index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
     return false;
   }
-  if (old_index == new_index) return true;
+  if (old_index == new_index) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return true;
+  }
 
   struct Filter target = manager->filters[old_index];
 
@@ -501,29 +599,51 @@ bool lv2_manager_move_filter(Lv2Manager *manager, size_t old_index, size_t new_i
   }
 
   manager->filters[new_index] = target;
+  pthread_mutex_unlock(&manager->process_mutex);
   return true;
 }
 
 bool lv2_manager_swap_filters(Lv2Manager *manager, size_t index_a, size_t index_b) {
-  if (!manager || index_a >= manager->filter_count || index_b >= manager->filter_count) {
+  if (!manager) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (index_a >= manager->filter_count || index_b >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
     return false;
   }
-  if (index_a == index_b) return true;
+  if (index_a == index_b) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return true;
+  }
 
   struct Filter temp = manager->filters[index_a];
   manager->filters[index_a] = manager->filters[index_b];
   manager->filters[index_b] = temp;
+  pthread_mutex_unlock(&manager->process_mutex);
   return true;
 }
 
 bool lv2_manager_set_bypass(Lv2Manager *manager, size_t index, bool enabled) {
-  if (!manager || index >= manager->filter_count) return false;
+  if (!manager) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return false;
+  }
   manager->filters[index].enabled = enabled;
+  pthread_mutex_unlock(&manager->process_mutex);
   return true;
 }
 
 bool lv2_manager_get_filter_info(Lv2Manager *manager, size_t index, Lv2FilterInfo *out_info) {
-  if (!manager || index >= manager->filter_count || !out_info) return false;
+  if (!manager || !out_info) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return false;
+  }
 
   struct Filter *f = &manager->filters[index];
   out_info->index = index;
@@ -547,6 +667,7 @@ bool lv2_manager_get_filter_info(Lv2Manager *manager, size_t index, Lv2FilterInf
   } else {
     out_info->params = NULL;
   }
+  pthread_mutex_unlock(&manager->process_mutex);
   return true;
 }
 
@@ -565,7 +686,13 @@ void lv2_manager_free_filter_info(Lv2FilterInfo *info) {
 }
 
 bool lv2_manager_set_param(Lv2Manager *manager, size_t filter_index, const char *symbol, float value) {
-  if (!manager || filter_index >= manager->filter_count || !symbol) return false;
+  if (!manager || !symbol) return false;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (filter_index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return false;
+  }
 
   struct Filter *f = &manager->filters[filter_index];
   for (size_t i = 0; i < f->param_count; i++) {
@@ -573,22 +700,33 @@ bool lv2_manager_set_param(Lv2Manager *manager, size_t filter_index, const char 
       uint32_t p = f->params[i].port_index;
       f->control_values[p] = value;
       f->params[i].current_val = value;
+      pthread_mutex_unlock(&manager->process_mutex);
       return true;
     }
   }
+  pthread_mutex_unlock(&manager->process_mutex);
   return false;
 }
 
 float lv2_manager_get_param(Lv2Manager *manager, size_t filter_index, const char *symbol) {
-  if (!manager || filter_index >= manager->filter_count || !symbol) return 0.0f;
+  if (!manager || !symbol) return 0.0f;
+
+  pthread_mutex_lock(&manager->process_mutex);
+  if (filter_index >= manager->filter_count) {
+    pthread_mutex_unlock(&manager->process_mutex);
+    return 0.0f;
+  }
 
   struct Filter *f = &manager->filters[filter_index];
   for (size_t i = 0; i < f->param_count; i++) {
     if (strcmp(f->params[i].symbol, symbol) == 0) {
       uint32_t p = f->params[i].port_index;
-      return f->control_values[p];
+      float val = f->control_values[p];
+      pthread_mutex_unlock(&manager->process_mutex);
+      return val;
     }
   }
+  pthread_mutex_unlock(&manager->process_mutex);
   return 0.0f;
 }
 
@@ -596,6 +734,8 @@ struct Output *lv2_manager_process(Lv2Manager *manager,
                                    const float *in_l, const float *in_r,
                                    int n_samples) {
   if (!manager || n_samples <= 0) return NULL;
+
+  pthread_mutex_lock(&manager->process_mutex);
 
   ensure_output_capacity(&manager->out1, n_samples);
   ensure_output_capacity(&manager->out2, n_samples);
@@ -612,6 +752,7 @@ struct Output *lv2_manager_process(Lv2Manager *manager,
     if (in_r) memcpy(manager->out1.pub.right, in_r, sizeof(float) * n_samples);
     else memset(manager->out1.pub.right, 0, sizeof(float) * n_samples);
 
+    pthread_mutex_unlock(&manager->process_mutex);
     return &manager->out1.pub;
   }
 
@@ -632,7 +773,7 @@ struct Output *lv2_manager_process(Lv2Manager *manager,
       lilv_instance_connect_port(f->instance, f->audio_in_l, src_buf->pub.left);
     }
     if (f->audio_in_r != (uint32_t)-1) {
-      lilv_instance_connect_port(f->instance, f->audio_in_r, src_buf->pub.right);
+      lilv_instance_connect_port(f->instance, f->audio_out_l != (uint32_t)-1 ? f->audio_in_r : f->audio_in_l, src_buf->pub.right);
     }
 
     if (f->audio_out_l != (uint32_t)-1) {
@@ -653,5 +794,6 @@ struct Output *lv2_manager_process(Lv2Manager *manager,
     dst_buf = tmp;
   }
 
+  pthread_mutex_unlock(&manager->process_mutex);
   return &src_buf->pub;
 }
